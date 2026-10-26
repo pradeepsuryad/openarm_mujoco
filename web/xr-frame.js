@@ -16,6 +16,68 @@
 // sends to its node (static/ar.js: sendFrame), so that xr-pose.js can be a
 // port of the node: { pose_reference, pose_left, pose_right, trigger_*,
 // grip_*, joystick_*, button_* }, poses as {x, y, z, qx, qy, qz, qw}.
+//
+// A tracked bare hand (WebXR Hand Input, which main.js requests as the
+// "hand-tracking" feature) fills the same pose_* and trigger_* fields, plus
+// hand_* = true, so the rest of the pipeline drives the arm from it as from
+// a controller held in that hand: see readHand.
+
+import { quatMul } from "./ik.js";
+
+// Bare hands. WebXR Hand Input gives each joint a pose whose -Z runs along
+// the bone toward the fingertips and whose +Y points out of the back of the
+// hand. A hand stands in for a controller held in it:
+//
+// * position: the middle finger's knuckle (middle-finger-phalanx-proximal),
+//   which a pinch barely moves, so closing the gripper does not drag the
+//   target with it;
+// * orientation: the wrist's, turned about its own z so that a hand held
+//   thumb up and pointing ahead gives the aim pose a controller held that way
+//   does (-Z ahead, +Y up), and CONTROLLER_TO_EE (xr-pose.js) applies as is;
+// * trigger: how far the thumb and index fingertips are pinched together.
+export const HAND_TO_AIM = {
+  left: [Math.SQRT1_2, 0, 0, -Math.SQRT1_2], // -90 degrees about z
+  right: [Math.SQRT1_2, 0, 0, Math.SQRT1_2], // +90 degrees about z
+};
+
+// Thumb-tip to index-tip distance between the joint centres, in meters, of a
+// closed pinch (the fingertips touching) and of an open one. Estimates: hand
+// size varies.
+export const PINCH_CLOSED = 0.02;
+export const PINCH_OPEN = 0.08;
+
+// Pinch distance to a trigger value: 0 open, 1 closed, linear in between.
+export function pinchToTrigger(distance) {
+  const t = (PINCH_OPEN - distance) / (PINCH_OPEN - PINCH_CLOSED);
+  return Math.min(1, Math.max(0, t));
+}
+
+// One tracked hand (an XRHand) to the { pose, trigger } a controller held in
+// it would give, or null when the headset has lost any of the joints this
+// needs: then the side is left out of the frame and its arm holds.
+export function readHand(hand, frame, space, handedness) {
+  const jointPose = (name) => {
+    const joint = hand.get(name);
+    return joint ? frame.getJointPose(joint, space) : null;
+  };
+  const wrist = jointPose("wrist");
+  const knuckle = jointPose("middle-finger-phalanx-proximal");
+  const thumb = jointPose("thumb-tip");
+  const index = jointPose("index-finger-tip");
+  if (!wrist || !knuckle || !thumb || !index) return null;
+  const o = wrist.transform.orientation;
+  const [qw, qx, qy, qz] = quatMul(
+    [o.w, o.x, o.y, o.z],
+    HAND_TO_AIM[handedness],
+  );
+  const p = knuckle.transform.position;
+  const a = thumb.transform.position;
+  const b = index.transform.position;
+  return {
+    pose: { x: p.x, y: p.y, z: p.z, qx, qy, qz, qw },
+    trigger: pinchToTrigger(Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z)),
+  };
+}
 
 // The controller profiles whose xr-standard gamepad layout is known:
 // buttons[0] trigger, [1] squeeze, [4]/[5] A/B on the right hand and X/Y on
@@ -57,6 +119,15 @@ export function readFrame(session, space, frame) {
   for (const source of session.inputSources) {
     if (source.handedness === "none") continue;
     const suffix = `_${source.handedness}`;
+    if (source.hand && frame.getJointPose) {
+      const hand = readHand(source.hand, frame, space, source.handedness);
+      if (hand) {
+        response[`pose${suffix}`] = hand.pose;
+        response[`trigger${suffix}`] = hand.trigger;
+        response[`hand${suffix}`] = true;
+      }
+      continue;
+    }
     // The target ray space is the OpenXR aim pose: its -Z points where the
     // controller points, which xr-pose.js maps onto the gripper axis. Not
     // the grip pose, whose -Z runs along the handle and would turn the

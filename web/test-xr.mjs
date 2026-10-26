@@ -14,7 +14,8 @@
 
 import assert from "node:assert/strict";
 // Headless tests of the WebXR teleoperation pipeline ported from
-// dora-openarm-webxr: frame reading (xr-frame.js), the controller pose to
+// dora-openarm-webxr: frame reading (xr-frame.js, controllers and bare
+// hands), the controller pose to
 // arm_origin-frame mapping, smoothing and world placement (xr-pose.js), and
 // the neck pivot calibration (calibration.js).
 // Run with: node --test test-xr.mjs
@@ -29,12 +30,19 @@ import {
   eulerZYXToQuat,
   poseLocalToWorld,
   poseWorldToLocal,
+  quatConj,
   quatError,
   quatMul,
   quatRotVec,
 } from "./ik.js";
 import { DEFAULT_HOME, TeleopState } from "./teleop.js";
-import { readFrame } from "./xr-frame.js";
+import {
+  HAND_TO_AIM,
+  PINCH_CLOSED,
+  PINCH_OPEN,
+  pinchToTrigger,
+  readFrame,
+} from "./xr-frame.js";
 import { wrapLine } from "./xr-hud.js";
 import {
   adjustPose,
@@ -575,6 +583,8 @@ function fakeSource(handedness, { profiles, buttons, axes, pose, mapping }) {
 const fakeFrame = (viewer) => ({
   getViewerPose: () => viewer && { transform: viewer },
   getPose: (space) => space.pose && { transform: space.pose },
+  getJointPose: (joint) =>
+    joint.pose && { transform: joint.pose, radius: 0.01 },
 });
 const transform = (pos, quat = [1, 0, 0, 0]) => ({
   position: { x: pos[0], y: pos[1], z: pos[2] },
@@ -693,6 +703,139 @@ describe("readFrame (ar.js: sendFrame)", () => {
     for (const b of ["button_a", "button_b", "button_x", "button_y"]) {
       assert.equal(r[b], undefined, b);
     }
+  });
+});
+
+// A tracked bare hand: an XRHand-like map of the joints readHand reads.
+// The target ray pose is far away on purpose: a hand must not use it.
+function fakeHandSource(handedness, joints) {
+  return {
+    handedness,
+    profiles: ["generic-hand"],
+    targetRaySpace: { pose: transform([9, 9, 9]) },
+    gamepad: null,
+    hand: new Map(
+      Object.entries(joints).map(([name, pose]) => [name, { pose }]),
+    ),
+  };
+}
+
+// The joints of a hand held thumb up and pointing ahead (WebXR -Z) at
+// `wrist`, with the thumb and index fingertips `pinch` apart. Thumb up, the
+// back of the right hand faces right and the left one's left, so the wrist
+// frame (+Y out of the back of the hand) is HAND_TO_AIM's inverse.
+function handJoints(side, wrist, pinch) {
+  const quat = quatConj(HAND_TO_AIM[side]);
+  const at = (d) =>
+    transform(
+      wrist.map((v, i) => v + d[i]),
+      quat,
+    );
+  return {
+    wrist: at([0, 0, 0]),
+    "middle-finger-phalanx-proximal": at([0, 0, -0.09]),
+    "thumb-tip": at([0, 0, -0.12]),
+    "index-finger-tip": at([0, -pinch, -0.12]),
+  };
+}
+
+describe("bare hands (WebXR Hand Input)", () => {
+  const viewer = transform([0, 1.6, 0]);
+  const hands = (rightPinch = PINCH_OPEN, leftPinch = PINCH_OPEN) => ({
+    inputSources: [
+      fakeHandSource("left", handJoints("left", [-0.2, 1.2, -0.3], leftPinch)),
+      fakeHandSource(
+        "right",
+        handJoints("right", [0.2, 1.2, -0.3], rightPinch),
+      ),
+    ],
+  });
+
+  it("maps the pinch distance onto the trigger", () => {
+    assert.equal(pinchToTrigger(PINCH_CLOSED), 1);
+    assert.equal(pinchToTrigger(PINCH_OPEN), 0);
+    assert.ok(
+      near(pinchToTrigger((PINCH_CLOSED + PINCH_OPEN) / 2), 0.5, 1e-12),
+    );
+    assert.equal(pinchToTrigger(0), 1, "pressed together: clamped");
+    assert.equal(pinchToTrigger(0.2), 0, "spread wide: clamped");
+  });
+
+  it("reads a hand like a controller held the same way", () => {
+    const pinch = (PINCH_CLOSED + PINCH_OPEN) / 2;
+    const r = readFrame(hands(pinch), {}, fakeFrame(viewer));
+    for (const [side, x] of [
+      ["left", -0.2],
+      ["right", 0.2],
+    ]) {
+      const p = r[`pose_${side}`];
+      nearVec([p.x, p.y, p.z], [x, 1.2, -0.39], 1e-12, `${side} knuckle`);
+      // thumb up and pointing ahead: the identity aim pose
+      assert.ok(
+        rotError([p.qw, p.qx, p.qy, p.qz], [1, 0, 0, 0]) < 1e-12,
+        `${side} orientation`,
+      );
+      assert.equal(r[`hand_${side}`], true);
+    }
+    assert.ok(near(r.trigger_right, 0.5, 1e-12));
+    assert.equal(r.trigger_left, 0, "open hand");
+    for (const b of ["button_a", "button_b", "button_x", "button_y"]) {
+      assert.equal(r[b], undefined, b);
+    }
+  });
+
+  it("leaves out a hand that has lost a joint, so its arm holds", () => {
+    const session = hands();
+    session.inputSources[1].hand.delete("thumb-tip");
+    const r = readFrame(session, {}, fakeFrame(viewer));
+    assert.equal(r.pose_right, undefined);
+    assert.equal(r.trigger_right, undefined);
+    assert.equal(r.hand_left, true, "the other hand still counts");
+  });
+
+  it("drives the arms end to end: a pinch closes the gripper", () => {
+    const teleop = new TeleopState();
+    const t = new XRTeleop({ mapping: "neck" });
+    const r = readFrame(hands(PINCH_CLOSED), {}, fakeFrame(viewer));
+    assert.deepEqual(t.processFrame(r, 0, teleop), ["left", "right"]);
+    assert.ok(near(teleop.arms.right.grip, 1, 1e-9), "pinched");
+    assert.equal(teleop.arms.left.grip, 0, "open");
+    const expected = adjustPose(r.pose_right, r.pose_reference, CONFIG);
+    nearVec(teleop.arms.right.pos, expected.pos, 1e-12);
+    // the same gripper orientation as a controller pointing ahead
+    assert.ok(rotError(teleop.arms.right.quat, HOME_QUAT) < 1e-9);
+  });
+
+  it("works next to a controller in the other hand", () => {
+    const quest = [
+      "meta-quest-touch-plus",
+      "generic-trigger-squeeze-thumbstick",
+    ];
+    const session = {
+      inputSources: [
+        fakeSource("left", {
+          profiles: quest,
+          pose: transform([-0.2, 1.2, -0.4]),
+          buttons: [
+            button(0.25),
+            button(0),
+            button(0),
+            button(0),
+            button(0),
+            button(0),
+          ],
+        }),
+        fakeHandSource(
+          "right",
+          handJoints("right", [0.2, 1.2, -0.3], PINCH_CLOSED),
+        ),
+      ],
+    };
+    const r = readFrame(session, {}, fakeFrame(viewer));
+    assert.equal(r.trigger_left, 0.25);
+    assert.equal(r.hand_left, undefined);
+    assert.ok(near(r.trigger_right, 1, 1e-9));
+    assert.equal(r.hand_right, true);
   });
 });
 

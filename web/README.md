@@ -97,6 +97,15 @@ calibration on, Y measures instead and the HUD stays open. Other controllers wit
 (`xr-standard`) layout move the arms and the grippers too, but have no
 X/B/Y: their buttons past the trigger and squeeze vary by vendor.
 
+**Bare hands.** On a headset with hand tracking, put the controllers
+down and the arms follow the hands: each hand drives its arm as a
+controller held in it would, and pinching the thumb and index finger
+together closes the gripper (`xr-frame.js`: `readHand`). The target is
+the middle finger's knuckle, which a pinch barely moves, and the
+gripper's orientation comes from the wrist. Hands have no buttons, so
+reset with the page's Reset button and leave with the headset's own
+gesture.
+
 The headset starts above and a little behind the robot's head,
 overlooking the table: `DEFAULT_VIEW_OFFSET` in `xr-pose.js` (0.08 m
 back, 0.3 m up, in the `arm_origin` frame: x forward, y left, z up) from
@@ -132,7 +141,7 @@ project's sources:
 
 | Module           | Ported from                    | What it does |
 |------------------|--------------------------------|--------------|
-| `xr-frame.js`    | `static/ar.js`                 | reads the headset pose, the controllers' target-ray poses, triggers, squeezes, thumbsticks and A/B/X/Y buttons out of an `XRFrame` into the frame object the dora client sends. |
+| `xr-frame.js`    | `static/ar.js`                 | reads the headset pose, the controllers' target-ray poses, triggers, squeezes, thumbsticks and A/B/X/Y buttons out of an `XRFrame` into the frame object the dora client sends. Tracked bare hands (`readHand`) are this page's own addition: they fill the same fields. |
 | `xr-pose.js`     | `main.py`, `smoothing.py`      | converts a controller pose into an `arm_origin`-frame target (the *neck* mapping: WebXR to robot axes, neck pivot subtraction, aim pose to gripper turn, frame offset; the *direct* one is this page's own), smooths it with the same One Euro filter, and writes it into `TeleopState` for the IK. |
 | `calibration.js` | `calibration.py`, `main.py`    | the neck pivot calibration: the least-squares fit of the point the head turns about, and the checks that accept or reject a run. |
 

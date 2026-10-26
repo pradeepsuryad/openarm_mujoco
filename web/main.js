@@ -898,7 +898,13 @@ async function main() {
 
   // WebXR: three's button (bottom center of the page) says "VR NOT
   // SUPPORTED" / "WEBXR NEEDS HTTPS" itself where a session cannot start.
-  document.body.appendChild(VRButton.createButton(app.renderer));
+  // "hand-tracking" lets bare hands drive the arms too (xr-frame.js:
+  // readHand); the controllers work as before.
+  document.body.appendChild(
+    VRButton.createButton(app.renderer, {
+      optionalFeatures: ["hand-tracking"],
+    }),
+  );
   // Both take effect with the next session, like dora-openarm-webxr's
   // command line options: the running one keeps the state it started with.
   const mapping = document.getElementById("hand-mapping");
